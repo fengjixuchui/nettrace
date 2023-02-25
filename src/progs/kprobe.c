@@ -1,8 +1,8 @@
 #define KBUILD_MODNAME ""
 #include <kheaders.h>
-#include <bpf_helpers.h>
-#include <bpf_endian.h>
-#include <bpf_tracing.h>
+#include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
+#include <bpf/bpf_tracing.h>
 
 #include "shared.h"
 #include <skb_utils.h>
@@ -10,7 +10,6 @@
 #include "kprobe_trace.h"
 
 #define MODE_SKIP_LIFE_MASK (TRACE_MODE_BASIC_MASK | TRACE_MODE_DROP_MASK)
-#define TRACE_PREFIX __trace_
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -18,6 +17,15 @@ struct {
 	__uint(value_size, sizeof(int));
 	__uint(max_entries, TRACE_MAX);
 } m_ret SEC(".maps");
+
+#ifdef STACK_TRACE
+struct {
+	__uint(type, BPF_MAP_TYPE_STACK_TRACE);
+	__uint(max_entries, 16384);
+	__uint(key_size, sizeof(__u32));
+	__uint(value_size, sizeof(stack_trace_t));
+} m_stack SEC(".maps");
+#endif
 
 #ifdef KERN_VER
 __u32 kern_ver SEC("version") = KERN_VER;
@@ -29,23 +37,6 @@ struct {
 	__uint(key_size, sizeof(u64));
 	__uint(value_size, sizeof(u8));
 } m_lookup SEC(".maps");
-
-enum args_status {
-	ARGS_END_OFFSET,
-	ARGS_STACK_OFFSET,
-	ARGS_RET_OFFSET,
-	ARGS_RET_ONLY_OFFSET,
-};
-
-#define ARGS_END	(1 << ARGS_END_OFFSET)
-#define ARGS_STACK	(1 << ARGS_STACK_OFFSET)
-#define ARGS_RET	(1 << ARGS_RET_OFFSET)
-#define ARGS_RET_ONLY	(1 << ARGS_RET_ONLY_OFFSET)
-
-typedef struct {
-	u16	func;
-	u16	status;
-} args_t;
 
 static try_inline void get_ret(int func)
 {
@@ -64,8 +55,38 @@ static try_inline int put_ret(int func)
 	return 0;
 }
 
-static try_inline int handle_entry(void *regs, struct sk_buff *skb, event_t *e,
-			       int size, int func)
+#ifdef STACK_TRACE
+static try_inline void try_trace_stack(void *regs, bpf_args_t *bpf_args,
+				       event_t *e, int func)
+{
+	int i = 0, key;
+	u16 *funcs;
+
+	if (!ARGS_GET(stack))
+		return;
+
+	funcs = ARGS_GET(stack_funs);
+
+#pragma unroll
+	for (; i < MAX_FUNC_STACK; i++) {
+		if (!funcs[i])
+			break;
+		if (funcs[i] == func)
+			goto do_stack;
+	}
+	return;
+
+do_stack:
+	key = bpf_get_stackid(regs, &m_stack, 0);
+	e->stack_id = key;
+}
+#else
+static try_inline void try_trace_stack(void *regs, bpf_args_t *bpf_args,
+				       event_t *e, int func) { }
+#endif
+
+static try_inline int handle_entry(void *regs, struct sk_buff *skb,
+				   event_t *e, int size, int func)
 {
 	packet_t *pkt = &e->pkt;
 	bool *matched;
@@ -75,6 +96,7 @@ static try_inline int handle_entry(void *regs, struct sk_buff *skb, event_t *e,
 	if (!ARGS_GET(ready))
 		return -1;
 
+	pr_debug_skb("begin to handle, func=%d", func);
 	pid = (u32)bpf_get_current_pid_tgid();
 	if (ARGS_GET(trace_mode) & MODE_SKIP_LIFE_MASK) {
 		if (!probe_parse_skb(skb, pkt))
@@ -97,7 +119,7 @@ skip_life:
 		goto out;
 
 	/* store more (detail) information about net or task. */
-	struct net_device *dev = _(skb->dev);
+	struct net_device *dev = _C(skb, dev);
 	detail_event_t *detail = (void *)e;
 
 	bpf_get_current_comm(detail->task, sizeof(detail->task));
@@ -105,12 +127,14 @@ skip_life:
 	if (dev) {
 		bpf_probe_read_str(detail->ifname, sizeof(detail->ifname) - 1,
 				   dev->name);
-		detail->ifindex = _(dev->ifindex);
+		detail->ifindex = _C(dev, ifindex);
 	} else {
-		detail->ifindex = _(skb->skb_iif);
+		detail->ifindex = _C(skb, skb_iif);
 	}
 
 out:
+	pr_debug_skb("pkt matched");
+	try_trace_stack(regs, bpf_args, e, func);
 	pkt->ts = bpf_ktime_get_ns();
 	e->key = (u64)(void *)skb;
 
@@ -129,8 +153,8 @@ static try_inline int handle_destroy(struct sk_buff *skb)
 }
 
 static try_inline int default_handle_entry(struct pt_regs *ctx,
-				       struct sk_buff *skb,
-				       int func)
+					   struct sk_buff *skb,
+					   int func)
 {
 	if (ARGS_GET_CONFIG(detail)) {
 		detail_event_t e = { .func = func };
@@ -166,26 +190,37 @@ static try_inline int handle_exit(struct pt_regs *regs, int func)
 	return 0;
 }
 
-#define DEFINE_KPROBE_RAW(name, skb_init)			\
+#define __BPF_KPROBE(name)	BPF_KPROBE(name)
+
+/* one trace may have more than one implement */
+#define __DEFINE_KPROBE_INIT(name, func_name, skb_init)		\
 	static try_inline int fake__##name(struct pt_regs *ctx,	\
 				       struct sk_buff *skb,	\
 				       int func);		\
-	SEC("kretprobe/"#name)					\
-	int BPF_KPROBE(ret__trace_##name)			\
+	SEC("kretprobe/"#func_name)				\
+	int __BPF_KPROBE(TRACE_RET_NAME(name))			\
 	{							\
 		return handle_exit(ctx, INDEX_##name);		\
 	}							\
-	SEC("kprobe/"#name)					\
-	int BPF_KPROBE(__trace_##name)				\
+	SEC("kprobe/"#func_name)				\
+	int __BPF_KPROBE(TRACE_NAME(name))			\
 	{							\
 		struct sk_buff *skb = (void *)skb_init;		\
 		return fake__##name(ctx, skb, INDEX_##name);	\
 	}							\
 	static try_inline int fake__##name(struct pt_regs *ctx,	\
-				       struct sk_buff *skb,	\
-				       int func)
+					   struct sk_buff *skb,	\
+					   int func)
+
+#define DEFINE_KPROBE_INIT(name, skb_init)			\
+	__DEFINE_KPROBE_INIT(name, name, skb_init)
+
 #define DEFINE_KPROBE(name, skb_index)				\
-	DEFINE_KPROBE_RAW(name, PT_REGS_PARM##skb_index(ctx))
+	DEFINE_KPROBE_INIT(name, PT_REGS_PARM##skb_index(ctx))
+
+#define DEFINE_KPROBE_TARGET(name, func_name, skb_index)	\
+	__DEFINE_KPROBE_INIT(name, func_name,			\
+			     PT_REGS_PARM##skb_index(ctx))
 
 #define KPROBE_DEFAULT(name, skb_index)				\
 	DEFINE_KPROBE(name, skb_index)				\
@@ -197,7 +232,7 @@ static try_inline int handle_exit(struct pt_regs *regs, int func)
 	static try_inline int fake_##name(void *ctx, struct sk_buff *skb,	\
 				      int func);		\
 	SEC("tp/"#cata"/"#tp)					\
-	int __trace_##name(void *ctx) {				\
+	int TRACE_NAME(name)(void *ctx) {			\
 		struct sk_buff *skb = *(void **)(ctx + offset);	\
 		return fake_##name(ctx, skb, INDEX_##name);	\
 	}							\
@@ -208,7 +243,9 @@ static try_inline int handle_exit(struct pt_regs *regs, int func)
 	{							\
 		return default_handle_entry(ctx, skb, func);	\
 	}
-_DEFINE_PROBE(KPROBE_DEFAULT, TP_DEFAULT)
+#define FNC(name)
+
+DEFINE_ALL_PROBES(KPROBE_DEFAULT, TP_DEFAULT, FNC)
 
 struct kfree_skb_args {
 	u64 pad;
@@ -232,23 +269,37 @@ DEFINE_TP(kfree_skb, skb, kfree_skb, 8)
 	return 0;
 }
 
-DEFINE_KPROBE_RAW(__netif_receive_skb_core_pskb,
-		  _(*(void **)(PT_REGS_PARM1(ctx))))
+__DEFINE_KPROBE_INIT(__netif_receive_skb_core_pskb, __netif_receive_skb_core,
+		    _(*(void **)(PT_REGS_PARM1(ctx))))
 {
 	return default_handle_entry(ctx, skb, func);
+}
+
+#define bpf_ipt_do_table()						\
+{									\
+	nf_event_t e = {						\
+		.event = { .func = func, },				\
+		.hook = _C(state, hook),				\
+	};								\
+									\
+	bpf_probe_read(e.table, sizeof(e.table) - 1, _C(table, name));	\
+	return handle_entry(ctx, skb, &e.event, sizeof(e), func);	\
 }
 
 DEFINE_KPROBE(ipt_do_table, 1)
 {
 	struct nf_hook_state *state = (void *)PT_REGS_PARM2(ctx);
 	struct xt_table *table = (void *)PT_REGS_PARM3(ctx);
-	nf_event_t e = {
-		.event = { .func = func, },
-		.hook = _C(state, hook),
-	};
 
-	bpf_probe_read(e.table, sizeof(e.table) - 1, _C(table, name));
-	return handle_entry(ctx, skb, &e.event, sizeof(e), func);
+	bpf_ipt_do_table();
+}
+
+DEFINE_KPROBE_TARGET(ipt_do_table_new, ipt_do_table, 2)
+{
+	struct nf_hook_state *state = (void *)PT_REGS_PARM3(ctx);
+	struct xt_table *table = (void *)PT_REGS_PARM1(ctx);
+
+	bpf_ipt_do_table();
 }
 
 DEFINE_KPROBE(nf_hook_slow, 1)
@@ -306,35 +357,10 @@ out:
 	return 0;
 }
 
-DEFINE_KPROBE_RAW(nft_do_chain, NULL)
-{
-	struct nft_pktinfo *pkt = (void *)PT_REGS_PARM1(ctx);
-	nf_event_t e = { .event = { .func = func, } };
-	struct nf_hook_state *state;
-	struct nft_chain *chain;
-	struct nft_table *table;
+#undef NFT_COMPAT
+#include "nft_do_chain.c"
 
-	skb = (struct sk_buff *)_(pkt->skb);
-	if (handle_entry(ctx, skb, &e.event, 0, func))
-		return 0;
-
-	if (ARGS_GET_CONFIG(nft_high))
-		state = _(((struct _nft_pktinfo_new *)pkt)->state);
-	else
-		state = _(((struct _nft_pktinfo *)pkt)->xt.state);
-
-	chain	= (void *)PT_REGS_PARM2(ctx);
-	table	= _CT(chain, table);
-	e.hook	= _C(state, hook);
-	e.pf	= _C(state, pf);
-
-	bpf_probe_read_kernel_str(e.chain, sizeof(e.chain),
-				  _CT(chain, name));
-	bpf_probe_read_kernel_str(e.table, sizeof(e.table),
-				  _CT(table, name));
-
-	EVENT_OUTPUT(ctx, e);
-	return 0;
-}
+#define NFT_COMPAT
+#include "nft_do_chain.c"
 
 char _license[] SEC("license") = "GPL";

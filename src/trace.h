@@ -19,12 +19,15 @@ enum trace_type {
 
 struct analyzer;
 
-#define TRACE_LOADED	(1 << 0)
-#define TRACE_ENABLE	(1 << 1)
-#define TRACE_INVALID	(1 << 2)
-#define TRACE_RET	(1 << 3)
+#define TRACE_LOADED		(1 << 0)
+#define TRACE_ENABLE		(1 << 1)
+#define TRACE_INVALID		(1 << 2)
+#define TRACE_RET		(1 << 3)
+#define TRACE_STACK		(1 << 4)
+#define TRACE_ATTACH_MANUAL	(1 << 5)
+#define TRACE_CHECKED		(1 << 6)
 
-#define trace_for_each(pos) list_for_each_entry(pos, &trace_list, sibling)
+#define trace_for_each(pos) list_for_each_entry(pos, &trace_list, all)
 
 typedef struct trace_group {
 	char	*name;
@@ -35,23 +38,32 @@ typedef struct trace_group {
 } trace_group_t;
 
 typedef struct trace {
-	char	*name;
+	/* name of the kernel function this trace targeted */
+	char	name[128];
 	char	*desc;
 	char	*msg;
+	/* name of the eBPF program */
 	char	*prog;
 	enum trace_type type;
-	char	*if_str;
+	char	*cond;
 	char	*regex;
 	char	*tp;
 	int	skb;
-	struct list_head sibling;
+	/* traces in a global list */
+	struct list_head all;
+	/* traces in the same group */
 	struct list_head list;
+	/* list head of rules that belongs to this trace */
 	struct list_head rules;
+	/* traces that share the same target */
+	struct trace *sibling;
 	int	index;
 	u32	status;
 	trace_group_t *parent;
 	struct analyzer *analyzer;
+	/* if this trace should be enabled by default */
 	bool	def;
+	bool	mutex;
 } trace_t;
 
 typedef struct trace_args {
@@ -63,18 +75,21 @@ typedef struct trace_args {
 	bool basic;
 	bool drop;
 	bool date;
+	bool drop_stack;
+	bool show_traces;
 	char *traces;
 } trace_args_t;
 
 typedef struct {
 	/* open and initialize the bpf program */
-	int (*trace_open)();
+	int (*trace_load)();
 	/* load and attach the bpf program */
-	int (*trace_load)(trace_t *trace);
+	int (*trace_attach)();
 	void (*trace_poll)(void *ctx, int cpu, void *data, u32 size);
 	int (*trace_anal)(event_t *e);
 	void (*trace_close)();
 	void (*trace_ready)();
+	void (*print_stack)(int key);
 	struct analyzer *analyzer;
 } trace_ops_t;
 
@@ -104,6 +119,11 @@ extern trace_group_t root_group;
 extern int trace_count;
 extern struct list_head trace_list;
 
+#define FNC(name)		extern trace_t trace_##name;
+#define FN(name, index)		FNC(name)
+#define FN_tp(name, a1, a2, a3) FNC(name)
+DEFINE_ALL_PROBES(FN, FN_tp, FNC)
+
 static inline trace_t *get_trace(int index)
 {
 	if (index < 0 || index > TRACE_MAX)
@@ -126,6 +146,18 @@ static inline bool trace_is_enable(trace_t *t)
 	return t->status & TRACE_ENABLE;
 }
 
+static inline void trace_set_invalid(trace_t *t)
+{
+	pr_debug("trace name=%s, prog=%s is made invalid\n", t->name,
+		 t->prog);
+	t->status |= TRACE_INVALID;
+}
+
+static inline bool trace_is_invalid(trace_t *t) 
+{
+	return t->status & TRACE_INVALID;
+}
+
 static inline void trace_set_ret(trace_t *t)
 {
 	t->status |= TRACE_RET;
@@ -134,6 +166,36 @@ static inline void trace_set_ret(trace_t *t)
 static inline bool trace_is_ret(trace_t *t)
 {
 	return t->status & TRACE_RET;
+}
+
+static inline int trace_set_stack(trace_t *t)
+{
+	int i = 0;
+
+	for (; i < MAX_FUNC_STACK; i++) {
+		if (!trace_ctx.bpf_args.stack_funs[i]) {
+			trace_ctx.bpf_args.stack_funs[i] = t->index;
+			break;
+		}
+	}
+	if (i == MAX_FUNC_STACK) {
+		pr_err("stack trace is full!\n");
+		return -1;
+	}
+
+	trace_ctx.bpf_args.stack = true;
+	t->status |= TRACE_STACK;
+	return 0;
+}
+
+static inline bool trace_is_stack(trace_t *t)
+{
+	return t->status & TRACE_STACK;
+}
+
+static inline bool trace_is_func(trace_t *t)
+{
+	return t->type == TRACE_FUNCTION;
 }
 
 static inline void trace_stop()
@@ -157,7 +219,7 @@ trace_group_t *search_trace_group(char *name);
 int trace_enable(char *name);
 int trace_group_enable(char *name);
 int trace_prepare();
-int trace_bpf_load();
+int trace_bpf_attach();
 int trace_poll();
 bool trace_analyzer_enabled(struct analyzer *analyzer);
 

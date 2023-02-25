@@ -18,13 +18,15 @@ int	exec(char *cmd, char *output);
 int	liberate_l();
 bool	fsearch(FILE *f, char *target);
 int	kernel_version();
+bool	debugfs_mounted();
+bool	kernel_has_config(char *name);
 
 static inline int simple_exec(char *cmd)
 {
 	return exec(cmd, NULL);
 }
 
-static inline bool file_exist(char *path)
+static inline bool file_exist(const char *path)
 {
 	return access(path, F_OK) == 0;
 }

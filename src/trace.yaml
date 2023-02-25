@@ -21,6 +21,9 @@ children:
     desc: link layer (L2) of packet in
     visual: true
     children:
+    - name: napi_gro_receive_entry
+      tp: net:napi_gro_receive_entry
+      skb: 24
     - name: dev_gro_receive:1
       rules:
       - exp: eq 4
@@ -51,11 +54,12 @@ children:
       - <<: *rule_ret_err
         msg: XDP failed to redirect skb
         adv: check if the target ifindex exist
-    - name: __netif_receive_skb_core:0
-      if: kernelVersion < 504
-    - name: __netif_receive_skb_core_pskb
+    - names:
+      - name: __netif_receive_skb_core_pskb
+        cond: '[ ! $(verlte "$(uname -r)" "5.4") -eq -1 ]' # valid when kernel >= 5.4
+      - name: __netif_receive_skb_core:0
       target: __netif_receive_skb_core
-      if: kernelVersion >= 504 # high version kernel use (struct sk_buff**)
+      mutex: true
   - name: link-out
     desc: link layer (L2) of packet out
     visual: true
@@ -100,14 +104,6 @@ children:
       analysis: ret
       msg: ebtable in POST_ROUTING
       rules: *rules_nf
-    - name: br_nf_post_routing:1
-      analysis: ret
-      msg: ebtable in POST_ROUTING
-      rules: *rules_nf
-    - name: br_nf_post_routing:1
-      analysis: ret
-      msg: ebtable in POST_ROUTING
-      rules: *rules_nf
   - name: arp
     visual: true
     desc: arp protocol
@@ -135,8 +131,13 @@ children:
     desc: base netfilter entry
     visual: true
     children:
-    - name: ipt_do_table
+    - names:
+      - name: ipt_do_table
+        cond: '[ $(verlte "$(uname -r)" "5.16") -eq -1 ]' # valid when kernel < 5.16
+      - name: ipt_do_table_new
       analyzer: iptable
+      mutex: true
+      target: ipt_do_table
       rules:
       - exp: eq 0
         level: error
@@ -145,8 +146,15 @@ children:
       - exp: eq 1
         level: info
         msg: packet is accepted
-    - name: nft_do_chain
+    - names:
+      - name: nft_do_chain
+        cond: >-
+          zgrep DEBUG_INFO_BTF_MODULES /proc/config.gz 2>/dev/null ||
+          grep " nft_do_chain$" /proc/kallsyms
+      - nft_do_chain_compat
       analyzer: iptable
+      target: nft_do_chain
+      mutex: true
       rules:
       - exp: eq 0
         level: error
@@ -206,6 +214,10 @@ children:
     - ip_local_deliver_finish:2
     - ip_forward:0
     - ip_forward_finish:0
+    - ip6_forward:0
+    - ip6_rcv_finish:2
+    - ip6_rcv_core:0
+    - ipv6_rcv:0
   - name: ip-out
     desc: ip layer of packet out
     visual: true
@@ -214,6 +226,35 @@ children:
     - ip_finish_output:2
     - ip_finish_output_gso:2
     - ip_finish_output2:2
+    - ip6_output:2
+    - ip6_finish_output:2
+    - ip6_finish_output2:2
+    - ip6_send_skb:0
+    - ip6_local_out:2
+  - name: xfrm
+    desc: xfrm module
+    visual: true
+    children:
+    - xfrm4_output:2
+    - xfrm_output:1
+    - xfrm_output2:2
+    - xfrm_output_gso:2
+    - xfrm_output_resume:1
+    - xfrm4_transport_output:1
+    - xfrm4_prepare_output:1
+    - xfrm4_policy_check:2
+    - xfrm4_rcv:0
+    - xfrm_input:0
+    - xfrm4_transport_input:1
+  - name: esp
+    desc: ip layer of packet out
+    visual: true
+    children:
+    - ah_output:1
+    - esp_output:1
+    - esp_output_tail:1
+    - ah_input:1
+    - esp_input:1
   - name: ip-route
     desc: ip route for packet in and out
     visual: true
@@ -238,14 +279,24 @@ children:
     visual: true
     children:
     - tcp_v4_rcv:0
+    - tcp_v6_rcv:0
     - tcp_filter:1
     - tcp_child_process:2
     - tcp_v4_send_reset:1
+    - tcp_v6_send_reset:1
     - tcp_v4_do_rcv:1
+    - tcp_v6_do_rcv:1
     - tcp_rcv_established:1
     - tcp_rcv_state_process:1
     - tcp_queue_rcv:1
     - name: __inet_lookup_listener:2
+      analyzer: ret
+      rules:
+      - exp: eq 0
+        level: warn
+        msg: tcp port is not listened
+        adv: check your target tcp port
+    - name: inet6_lookup_listener:2
       analyzer: ret
       rules:
       - exp: eq 0
@@ -276,6 +327,18 @@ children:
     - icmp_rcv:0
     - icmp_echo:0
     - icmp_reply:1
+    - icmpv6_rcv:0
+    - icmpv6_echo_reply:0
+    - ping_rcv:0
+    - __ping_queue_rcv_skb:1
+    - ping_queue_rcv_skb:1
+    - name: ping_lookup:1
+      analyzer: ret
+      rules:
+      - exp: eq 0
+        level: warn
+        msg: icmp socket is not founded
+        adv: not support
 - name: life
   desc: skb clone and free
   visual: true
@@ -292,7 +355,7 @@ children:
       msg: packet is cloned
   - name: consume_skb
     tp: skb:consume_skb
-    skb: 0
+    skb: 8
     analyzer: free
     rules:
     - exp: any

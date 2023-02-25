@@ -1,6 +1,8 @@
 #ifndef _H_PROGS_SHARED
 #define _H_PROGS_SHARED
 
+#define MAX_FUNC_STACK 16
+
 #define DEFINE_BPF_ARGS()	\
 	u32  trace_mode;	\
 	u32  pid;		\
@@ -10,7 +12,9 @@
 	bool detail;		\
 	bool hooks;		\
 	bool ready;		\
-	bool nft_high;
+	bool nft_high;		\
+	bool stack;		\
+	u16  stack_funs[MAX_FUNC_STACK];
 
 #include <skb_shared.h>
 
@@ -18,6 +22,9 @@ typedef struct __attribute__((__packed__)) {
 	packet_t	pkt;
 	u64		key;
 	u32		func;
+#ifdef STACK_TRACE
+	u32		stack_id;
+#endif
 } event_t;
 
 typedef struct __attribute__((__packed__)) {
@@ -82,22 +89,14 @@ typedef enum trace_mode {
 #define TRACE_MODE_INETL_MASK		(1 << TRACE_MODE_INETL)
 #define TRACE_MODE_DROP_MASK		(1 << TRACE_MODE_DROP)
 
-struct _xt_action_param {
-	void *arg1;
-	void *arg2;
-	void *state;
-};
+#define __MACRO_SIZE(macro)	sizeof(#macro)
+#define MACRO_SIZE(macro)	__MACRO_SIZE(macro)
+#define __MACRO_CONCAT(a, b)	a##b
+#define MACRO_CONCAT(a, b)	__MACRO_CONCAT(a, b)
 
-struct _nft_pktinfo {
-	void			*skb;
-	bool			tprot_set;
-	u8			tprot;
-	struct _xt_action_param	xt;
-};
-
-struct _nft_pktinfo_new {
-	void	*skb;
-	void	*state;
-};
-
+#define TRACE_PREFIX		__trace_
+#define TRACE_RET_PREFIX	ret__trace_
+#define TRACE_PREFIX_LEN	MACRO_SIZE(TRACE_PREFIX)
+#define TRACE_NAME(name)	MACRO_CONCAT(TRACE_PREFIX, name)
+#define TRACE_RET_NAME(name)	MACRO_CONCAT(TRACE_RET_PREFIX, name)
 #endif

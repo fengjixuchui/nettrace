@@ -141,14 +141,15 @@ static inline void analy_entry_free(analy_entry_t *entry)
 static void analy_entry_handle(analy_entry_t *entry)
 {
 	packet_t *pkt = &entry->event->pkt;
-	static char buf[1024], tinfo[128];
+	static char buf[1024], tinfo[256];
+	event_t *e = entry->event;
 	rule_t *rule;
 	trace_t *t;
 
 	t = get_trace_from_analy_entry(entry);
 	pr_debug("output entry(%llx)\n", PTR2X(entry));
 	if (trace_ctx.detail) {
-		detail_event_t *detail = (void *)entry->event;
+		detail_event_t *detail = (void *)e;
 		static char ifbuf[IF_NAMESIZE];
 		char *ifname = detail->ifname;
 
@@ -195,6 +196,8 @@ static void analy_entry_handle(analy_entry_t *entry)
 	}
 out:
 	pr_info("%s\n", buf);
+	if (trace_is_stack(t))
+		trace_ctx.ops->print_stack(e->stack_id);
 }
 
 static void analy_ctx_free(analy_ctx_t *ctx)
@@ -473,7 +476,7 @@ DEFINE_ANALYZER_ENTRY(drop, TRACE_MODE_TIMELINE_MASK | TRACE_MODE_INETL_MASK |
 	struct sym_result *sym;
 
 	reason = get_drop_reason(event->reason);
-	sym = parse_sym(event->location);
+	sym = sym_parse(event->location);
 	sym_str = sym ? sym->desc : "unknow";
 
 	info = malloc(1024);
@@ -585,7 +588,7 @@ DEFINE_ANALYZER_EXIT(nf, TRACE_MODE_INETL_MASK)
 
 		if (!hook)
 			break;
-		sym = parse_sym_exact(hook);
+		sym = sym_parse_exact(hook);
 		if (sym)
 			sprintf_end(extinfo, "\t%s\n", sym->name);
 		else

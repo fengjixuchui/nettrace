@@ -5,51 +5,30 @@
  * code.
  */
 
-#include <bpf_core_read.h>
+#include <bpf/bpf_core_read.h>
 
 #include "macro.h"
 #include "skb_shared.h"
 
 typedef struct {
 	pkt_args_t pkt;
+#ifdef BPF_DEBUG
+	bool bpf_debug;
+#endif
 #ifdef DEFINE_BPF_ARGS
 	DEFINE_BPF_ARGS();
 #endif
 } bpf_args_t;
 
+#define MAX_ENTRIES 256
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
 	__uint(key_size, sizeof(int));
 	__uint(value_size, sizeof(u32));
-	__uint(max_entries, 64);
+	__uint(max_entries, MAX_ENTRIES);
 } m_event SEC(".maps");
 
-#define EVENT_OUTPUT(ctx, data)					\
-	bpf_perf_event_output(ctx, &m_event, BPF_F_CURRENT_CPU,	\
-			      &(data), sizeof(data))
-
-#define _(src)							\
-({								\
-	typeof(src) tmp;					\
-	bpf_probe_read_kernel(&tmp, sizeof(src), &(src));	\
-	tmp;							\
-})
-
-#undef _C
-#ifdef COMPAT_MODE
-#define _C(src, a)	_(src->a)
-#define _CF(src, a)	_(src->a)
-#else
-#define _C(src, a, ...)		BPF_CORE_READ(src, a, ##__VA_ARGS__)
-#endif
-
-#ifdef CORE_FULL
-#define _CT(src, a, ...)	BPF_CORE_READ(src, a, ##__VA_ARGS__)
-#else
-#define _CT(src, a, ...)	_(src->a)
-#endif
-
-#ifdef COMPAT_MODE
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(key_size, sizeof(int));
@@ -65,12 +44,40 @@ struct {
 	(bpf_args_t*)_v;					\
 })
 
+#define EVENT_OUTPUT(ctx, data)					\
+	bpf_perf_event_output(ctx, &m_event, BPF_F_CURRENT_CPU,	\
+			      &(data), sizeof(data))
+
+#define _(src)							\
+({								\
+	typeof(src) tmp;					\
+	bpf_probe_read_kernel(&tmp, sizeof(src), &(src));	\
+	tmp;							\
+})
+
+#undef _C
+#ifdef COMPAT_MODE
+#define _C(src, a)	_(src->a)
+#else
+#define _C(src, a, ...)		BPF_CORE_READ(src, a, ##__VA_ARGS__)
+#endif
+
+#ifdef COMPAT_MODE
 #define try_inline __attribute__((always_inline))
 #else
-bpf_args_t _bpf_args;
-#define CONFIG() &_bpf_args
 #define try_inline inline
 #endif
+
+#ifdef BPF_DEBUG
+#define pr_bpf_deubg(fmt, ...) {				\
+	if (((bpf_args_t *)bpf_args)->bpf_debug)		\
+		bpf_printk("nettrace: "fmt"\n", __VA_ARGS__);	\
+}
+#else
+#define pr_bpf_deubg(fmt, ...)
+#endif
+#define pr_debug_skb(fmt, ...)	\
+	pr_bpf_deubg("skb=%llx, "fmt, (u64)(void *)skb, ##__VA_ARGS__)
 
 #define ARGS_INIT()		bpf_args_t *bpf_args = CONFIG();
 #define ARGS_PKT()		(&bpf_args->pkt)
@@ -267,6 +274,7 @@ static try_inline int probe_parse_ip(void *ip, parse_ctx_t *ctx)
 		pkt->l4.udp.dport = dport;
 		break;
 	}
+	case IPPROTO_ICMPV6:
 	case IPPROTO_ICMP: {
 		struct icmphdr *icmp = l4;
 
@@ -276,6 +284,14 @@ static try_inline int probe_parse_ip(void *ip, parse_ctx_t *ctx)
 		pkt->l4.icmp.type = _(icmp->type);
 		pkt->l4.icmp.seq = _(icmp->un.echo.sequence);
 		pkt->l4.icmp.id = _(icmp->un.echo.id);
+		break;
+	}
+	case IPPROTO_ESP: {
+		struct ip_esp_hdr *esp_hdr = l4;
+		if (ATTR_ENABLE(port))
+			goto err;
+		pkt->l4.espheader.seq = _(esp_hdr->seq_no);
+		pkt->l4.espheader.spi = _(esp_hdr->spi);
 		break;
 	}
 	default:
@@ -299,6 +315,10 @@ static try_inline int probe_parse_skb_cond(parse_ctx_t *ctx)
 	ctx->network_header = _C(skb, network_header);
 	ctx->mac_header = _C(skb, mac_header);
 	ctx->data = _C(skb, head);
+
+	pr_debug_skb("begin to parse, nh=%d mh=%d", ctx->network_header,
+		     ctx->mac_header);
+	pr_debug_skb("th=%d", _C(skb, transport_header));
 
 	if (skb_l2_check(ctx->mac_header)) {
 		/*
@@ -330,6 +350,7 @@ static try_inline int probe_parse_skb_cond(parse_ctx_t *ctx)
 
 	ctx->trans_header = _C(skb, transport_header);
 	pkt->proto_l3 = l3_proto;
+	pr_debug_skb("l3=%d", l3_proto);
 
 	switch (l3_proto) {
 	case ETH_P_IPV6:

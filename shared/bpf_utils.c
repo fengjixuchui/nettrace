@@ -14,34 +14,44 @@
 
 #include "bpf_utils.h"
 
-void
-perf_output_cond(int fd, perf_buffer_sample_fn cb, perf_buffer_lost_fn lost,
+int
+perf_output_cond(int fd, perf_buffer_sample_fn callback,
+		 perf_buffer_lost_fn lost_cb,
 		 bool *stop)
 {
+#if defined(LIBBPF_MAJOR_VERSION) && (LIBBPF_MAJOR_VERSION >= 1)
+	struct perf_buffer *pb;
+	int err;
+
+	pb = perf_buffer__new(fd, 1024, callback, lost_cb, NULL, NULL);
+#else
 	struct perf_buffer_opts pb_opts = {
-		.sample_cb = cb,
-		.lost_cb = lost,
+		.sample_cb = callback,
+		.lost_cb = lost_cb,
 	};
 	struct perf_buffer *pb;
-	int ret;
+	int err;
 
 	pb = perf_buffer__new(fd, 1024, &pb_opts);
-	ret = libbpf_get_error(pb);
-	if (ret) {
-		printf("failed to setup perf_buffer: %d\n", ret);
-		return;
+#endif
+
+	err = libbpf_get_error(pb);
+	if (err) {
+		printf("failed to setup perf_buffer: %d\n", err);
+		return err;
 	}
 
-	while ((ret = perf_buffer__poll(pb, 1000)) >= 0)
+	while ((err = perf_buffer__poll(pb, 1000)) >= 0)
 		if (stop && *stop)
 			break;
+	return 0;
 }
 
 int compat_bpf_attach_kprobe(int fd, char *name, bool ret)
 {
 	struct perf_event_attr attr = {};
 	char buf[1024], target[128];
-	int id, err;
+	int id, err, i = 0;
 
 	attr.type = PERF_TYPE_TRACEPOINT;
 	attr.sample_type = PERF_SAMPLE_RAW;
@@ -49,8 +59,19 @@ int compat_bpf_attach_kprobe(int fd, char *name, bool ret)
 	attr.wakeup_events = 1;
 
 	sprintf(target, "%s%s", ret ? "ret_" : "", name);
+
+	/* replace '.' with '_' in the event name, as it don't support
+	 * '.' in the kprobe event name.
+	 */
+	while (target[i] != '\0') {
+		if (target[i] == '.')
+			target[i] = '_';
+		i++;
+	}
+
 	sprintf(buf, "/sys/kernel/debug/tracing/events/kprobes/%s/id",
 		target);
+
 	if (file_exist(buf))
 		goto exist;
 

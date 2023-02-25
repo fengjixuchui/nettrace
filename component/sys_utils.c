@@ -33,18 +33,15 @@ int exec(char *cmd, char *output)
 		strcat(output + strlen(output), buf);
 	}
 
-	pr_debug("command: %s\n", cmd);
 	status = pclose(f);
+	pr_debug("command: %s, status:%d\n", cmd, WEXITSTATUS(status));
 	return WEXITSTATUS(status);
 }
 
 int execf(char *output, char *fmt, ...)
 {
-	char *cmd = malloc(1024);
+	static char cmd[1024];
 	va_list valist;
-
-	if (!cmd)
-		return -ENOMEM;
 
 	va_start(valist, fmt);
 	vsprintf(cmd, fmt, valist);
@@ -79,4 +76,15 @@ int kernel_version()
 	sscanf(buf.release, "%d.%d.%d", &major, &minor, &patch);
 
 	return kv_to_num(major, minor, patch);
+}
+
+bool debugfs_mounted()
+{
+	return simple_exec("mount | grep debugfs") == 0;
+}
+
+bool kernel_has_config(char *name)
+{
+	return execf(NULL, "zgrep 'CONFIG_%s=y' /proc/config.gz 2>/dev/null",
+		     name) == 0;
 }

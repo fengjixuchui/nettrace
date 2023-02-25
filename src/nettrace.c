@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 
+#include <arpa/inet.h>
+
 #include <arg_parse.h>
 #include <common_args.h>
 
@@ -14,15 +16,14 @@ arg_config_t config = {
 
 static void do_parse_args(int argc, char *argv[])
 {
+	bool show_log = false, debug = false, version = false;
 	trace_args_t *trace_args = &trace_ctx.args;
 	bpf_args_t *bpf_args = &trace_ctx.bpf_args;
 	pkt_args_t *pkt_args = &bpf_args->pkt;
-	bool show_log = false, debug = false;
-	int proto_l = 0;
-	u16 proto;
+	COMMON_PROG_ARGS_BEGIN()
 
 	option_item_t opts[] = {
-		COMMON_PROG_ARGS(pkt_args),
+		COMMON_PROG_ARGS_DEFINE(pkt_args),
 		{
 			.lname = "pid", .type = OPTION_U32,
 			.dest = &bpf_args->pid, .set = &bpf_args->enable_pid,
@@ -78,6 +79,13 @@ static void do_parse_args(int argc, char *argv[])
 			.type = OPTION_BOOL,
 			.desc = "skb drop monitor mode, for replace of 'droptrace'",
 		},
+#ifdef STACK_TRACE
+		{
+			.lname = "drop-stack", .dest = &trace_args->drop_stack,
+			.type = OPTION_BOOL,
+			.desc = "print the kernel function call stack of kfree_skb",
+		},
+#endif
 		{ .type = OPTION_BLANK },
 		{
 			.sname = 'v', .dest = &show_log,
@@ -89,11 +97,24 @@ static void do_parse_args(int argc, char *argv[])
 			.type = OPTION_BOOL,
 			.desc = "show debug information",
 		},
+#ifdef BPF_DEBUG
+		{
+			.lname = "bpf-debug", .dest = &bpf_args->bpf_debug,
+			.type = OPTION_BOOL,
+			.desc = "show bpf debug information",
+		},
+#endif
 		{
 			.lname = "help",
 			.sname = 'h',
 			.type = OPTION_HELP,
 			.desc = "show help information",
+		},
+		{
+			.lname = "version", .dest = &version,
+			.sname = 'V',
+			.type = OPTION_BOOL,
+			.desc = "show nettrace version",
 		},
 	};
 
@@ -109,18 +130,12 @@ static void do_parse_args(int argc, char *argv[])
 	else
 		set_log_level(2);
 
-	switch (proto_l) {
-	case 3:
-		pkt_args->enable_l3_proto = true;
-		pkt_args->l3_proto = proto;
-		break;
-	case 4:
-		pkt_args->enable_l4_proto = true;
-		pkt_args->l4_proto = proto;
-		break;
-	default:
-		break;
+	if (version) {
+		pr_version();
+		exit(0);
 	}
+
+	COMMON_PROG_ARGS_END(pkt_args)
 
 	return;
 err:
@@ -137,7 +152,7 @@ int main(int argc, char *argv[])
 		goto err;
 
 	set_trace_ops(&probe_ops);
-	if (trace_bpf_load()) {
+	if (trace_bpf_attach()) {
 		pr_err("failed to load kprobe-based bpf\n");
 		goto err;
 	}

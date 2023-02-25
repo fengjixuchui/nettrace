@@ -1,14 +1,14 @@
-LIBBPF		?= /usr/include/bpf
 COMPONENT	:= $(ROOT)/component
 COMMON_SHARED	:= $(ROOT)/shared/pkt_utils.c $(COMPONENT)/net_utils.c	\
 		   $(COMPONENT)/arg_parse.c $(COMPONENT)/sys_utils.c	\
 		   $(ROOT)/shared/bpf_utils.c
 
 CFLAGS		+= -I./ -I$(ROOT)/shared/bpf/
-BPF_CFLAGS	= $(CFLAGS) -I$(LIBBPF) -Wno-unused-function
+BPF_CFLAGS	= $(CFLAGS) -Wno-unused-function
 HOST_CFLAGS	= \
-		-lbpf -lelf -lz -g -O2 -static $(CFLAGS) \
-		-Wno-deprecated-declarations \
+		-lbpf -lelf -lz -g -O2 -static $(CFLAGS)		\
+		-Wno-deprecated-declarations -DVERSION=$(VERSION)	\
+		-DRELEASE=$(RELEASE)					\
 		-I$(ROOT)/shared/ -I$(ROOT)/component
 
 REMOTE_ROOT	:= https://raw.githubusercontent.com/xmmgithub/nettrace-eBPF/master/
@@ -18,7 +18,6 @@ include $(ROOT)/script/arch.mk
 
 HEADERS		:= $(if $(KERNEL),$(KERNEL),/lib/modules/$(shell uname -r)/build/)
 NOSTDINC_FLAGS	+= -nostdinc -isystem $(shell $(CC) -print-file-name=include)
-BTF		:= $(if $(VMLINUX),$(VMLINUX),/sys/kernel/btf/vmlinux)
 export HEADERS
 
 USERINCLUDE	:= \
@@ -26,7 +25,8 @@ USERINCLUDE	:= \
 		-I$(HEADERS)/arch/$(SRCARCH)/include/generated/uapi \
 		-I$(HEADERS)/include/uapi \
 		-I$(HEADERS)/include/generated/uapi \
-		-include $(HEADERS)/include/linux/kconfig.h
+		-include $(HEADERS)/include/linux/kconfig.h \
+		-I/usr/include/
 
 LINUXINCLUDE	:= \
 		-I$(HEADERS)/arch/$(SRCARCH)/include \
@@ -42,45 +42,42 @@ KERNEL_CFLAGS	+= $(NOSTDINC_FLAGS) $(LINUXINCLUDE) \
 		-Wno-unknown-warning-option -Wno-frame-address
 
 cmd_download	= @if [ ! -f $(1) ]; then wget -O $(1) $(REMOTE_ROOT)/$(2); fi
-cmd_exist	= $(if $(wildcard $(1)),$(2),$(3))
-cmd_or_exist	= $(call cmd_exist,$(1),$(1),$(2))
-ifeq ("$(wildcard $(HEADERS))$(wildcard $(BTF))","")
-$(error BTF is not found in your system, please install kernel headers)
+
+ifdef KERN_VER
+	CFLAGS		+= -DKERN_VER=$(KERN_VER)
 endif
 
-ifeq ($(if $(KERNEL),$(wildcard $(KERNEL)),"pass"),)
-$(error kernel path not exist)
+ifdef COMPAT
+ifeq ($(wildcard $(HEADERS)),)
+$(error kernel headers not exist in COMPAT mdoe, please install it)
 endif
-
-ifeq ($(if $(VMLINUX),$(wildcard $(VMLINUX)),"pass"),)
-$(error vmlinux path not exist)
-endif
-
-# preferred to compile from kernel headers, then BTF
-mode := $(if $(VMLINUX),'btf',$(call cmd_exist,$(HEADERS),'kernel','btf'))
-ifeq ($(mode),'btf')
-	kheaders_cmd	:= ln -s vmlinux.h kheaders.h
-	kheaders_dep	:= vmlinux.h
-else
 	kheaders_cmd	:= ln -s vmlinux_header.h kheaders.h
-	BPF_CFLAGS	+= $(KERNEL_CFLAGS)
+	CFLAGS		+= -DCOMPAT_MODE
+	BPF_CFLAGS	+= $(KERNEL_CFLAGS) -DBPF_NO_GLOBAL_DATA
+else
+	kheaders_cmd	:= ln -s ../shared/bpf/vmlinux.h kheaders.h
 endif
 
 ifndef BPFTOOL
 ifneq ("$(shell bpftool gen help 2>&1 | grep skeleton)","")
 	BPFTOOL		:= bpftool
 else
-	BPFTOOL		:= $(ROOT)/script/bpftool
+ifeq ("$(shell uname -m)","x86_64")
+	BPFTOOL		:= $(ROOT)/script/bpftool-x86
+else
+	BPFTOOL		:= $(ROOT)/script/bpftool-arm
+endif
 endif
 endif
 
-vmlinux.h:
-	$(BPFTOOL) btf dump file $(BTF) format c > vmlinux.h
+ifdef BPF_DEBUG
+	CFLAGS		+= -DBPF_DEBUG
+endif
 
-kheaders.h: $(kheaders_dep)
+kheaders.h:
 	$(call kheaders_cmd)
 
-progs/%.o: progs/%.c kheaders.h
+progs/%.o: progs/%.c $(BPF_EXTRA_DEP)
 	clang -O2 -c -g -S -Wall -Wno-pointer-sign -Wno-unused-value	\
 	-Wno-incompatible-pointer-types-discards-qualifiers		\
 	-fno-asynchronous-unwind-tables					\
@@ -92,7 +89,7 @@ progs/%.o: progs/%.c kheaders.h
 	@file $@ | grep debug_info > /dev/null || (rm $@ && exit 1)
 
 %.skel.h: %.o
-	$(BPFTOOL) gen skeleton $< $(SKEL_FLAGS) > $@
+	$(BPFTOOL) gen skeleton $< > $@
 
 $(bpf_progs): %: %.skel.h
 	@:
