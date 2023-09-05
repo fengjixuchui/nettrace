@@ -25,9 +25,16 @@ struct analyzer;
 #define TRACE_RET		(1 << 3)
 #define TRACE_STACK		(1 << 4)
 #define TRACE_ATTACH_MANUAL	(1 << 5)
-#define TRACE_CHECKED		(1 << 6)
+#define TRACE_RET_ONLY		(1 << 6)
 
-#define trace_for_each(pos) list_for_each_entry(pos, &trace_list, all)
+#define trace_for_each(pos)		\
+	list_for_each_entry(pos, &trace_list, all)
+#define trace_for_each_cond(pos, cond)	\
+	trace_for_each(pos) 		\
+		if (cond)
+
+#define bpf_pbn(obj, name)	\
+	bpf_object__find_program_by_name(obj, name)
 
 typedef struct trace_group {
 	char	*name;
@@ -36,6 +43,12 @@ typedef struct trace_group {
 	struct list_head list;
 	struct list_head traces;
 } trace_group_t;
+
+enum {
+	TRACE_MONITOR_EXIT = 1,
+	TRACE_MONITOR_ENTRY,
+	TRACE_MONITOR_ALL,
+};
 
 typedef struct trace {
 	/* name of the kernel function this trace targeted */
@@ -49,6 +62,7 @@ typedef struct trace {
 	char	*regex;
 	char	*tp;
 	int	skb;
+	int	sk;
 	/* traces in a global list */
 	struct list_head all;
 	/* traces in the same group */
@@ -56,15 +70,23 @@ typedef struct trace {
 	/* list head of rules that belongs to this trace */
 	struct list_head rules;
 	/* traces that share the same target */
-	struct trace *sibling;
+	struct trace *backup;
+	bool	is_backup;
+	bool	probe;
+	int	monitor;
 	int	index;
+	int	arg_count;
 	u32	status;
 	trace_group_t *parent;
 	struct analyzer *analyzer;
 	/* if this trace should be enabled by default */
 	bool	def;
-	bool	mutex;
 } trace_t;
+
+typedef struct {
+	struct list_head list;
+	trace_t * trace;
+} trace_list_t;
 
 typedef struct trace_args {
 	bool timeline;
@@ -73,11 +95,19 @@ typedef struct trace_args {
 	bool intel_quiet;
 	bool intel_keep;
 	bool basic;
+	bool monitor;
 	bool drop;
 	bool date;
 	bool drop_stack;
 	bool show_traces;
+	bool sock;
+	bool netns_current;
+	bool force;
+	u32  min_latency;
 	char *traces;
+	char *traces_stack;
+	char *pkt_len;
+	char *tcp_flags;
 } trace_args_t;
 
 typedef struct {
@@ -90,6 +120,8 @@ typedef struct {
 	void (*trace_close)();
 	void (*trace_ready)();
 	void (*print_stack)(int key);
+	void (*trace_feat_probe)();
+	bool (*trace_supported)();
 	struct analyzer *analyzer;
 } trace_ops_t;
 
@@ -111,7 +143,6 @@ typedef struct {
 
 #define BPF_ARG_GET(name) (trace_ctx.bpf_args.name)
 
-extern trace_ops_t probe_ops;
 extern trace_context_t trace_ctx;
 
 extern trace_t *all_traces[];
@@ -119,10 +150,8 @@ extern trace_group_t root_group;
 extern int trace_count;
 extern struct list_head trace_list;
 
-#define FNC(name)		extern trace_t trace_##name;
-#define FN(name, index)		FNC(name)
-#define FN_tp(name, a1, a2, a3) FNC(name)
-DEFINE_ALL_PROBES(FN, FN_tp, FNC)
+#define DECLARE_TRACES(name, ...) extern trace_t trace_##name;
+DEFINE_ALL_PROBES(DECLARE_TRACES, DECLARE_TRACES, DECLARE_TRACES)
 
 static inline trace_t *get_trace(int index)
 {
@@ -146,16 +175,30 @@ static inline bool trace_is_enable(trace_t *t)
 	return t->status & TRACE_ENABLE;
 }
 
+static inline void trace_set_invalid_reason(trace_t *t, const char *reason)
+{
+	if (reason)
+		pr_debug("trace name=%s, prog=%s is made invalid for: %s\n",
+			 t->name, t->prog, reason);
+	else
+		pr_debug("trace name=%s, prog=%s is made invalid\n",
+			 t->name, t->prog);
+	t->status |= TRACE_INVALID;
+}
+
 static inline void trace_set_invalid(trace_t *t)
 {
-	pr_debug("trace name=%s, prog=%s is made invalid\n", t->name,
-		 t->prog);
-	t->status |= TRACE_INVALID;
+	trace_set_invalid_reason(t, NULL);
 }
 
 static inline bool trace_is_invalid(trace_t *t) 
 {
 	return t->status & TRACE_INVALID;
+}
+
+static inline bool trace_is_usable(trace_t *t)
+{
+	return trace_is_enable(t) && !trace_is_invalid(t);
 }
 
 static inline void trace_set_ret(trace_t *t)
@@ -166,6 +209,16 @@ static inline void trace_set_ret(trace_t *t)
 static inline bool trace_is_ret(trace_t *t)
 {
 	return t->status & TRACE_RET;
+}
+
+static inline void trace_set_retonly(trace_t *t)
+{
+	t->status |= TRACE_RET_ONLY;
+}
+
+static inline bool trace_is_retonly(trace_t *t)
+{
+	return t->status & TRACE_RET_ONLY;
 }
 
 static inline int trace_set_stack(trace_t *t)
@@ -210,17 +263,16 @@ static inline bool trace_mode_timeline()
 
 static inline bool trace_mode_intel()
 {
-	return trace_ctx.mode == TRACE_MODE_INETL;
+	return trace_ctx.mode == TRACE_MODE_DIAG;
 }
 
 void trace_show(trace_group_t *group);
 void init_trace_group();
 trace_group_t *search_trace_group(char *name);
-int trace_enable(char *name);
-int trace_group_enable(char *name);
 int trace_prepare();
-int trace_bpf_attach();
+int trace_bpf_load_and_attach();
 int trace_poll();
 bool trace_analyzer_enabled(struct analyzer *analyzer);
+int trace_pre_load();
 
 #endif

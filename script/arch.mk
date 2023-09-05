@@ -1,4 +1,4 @@
-ARCH := $(shell uname -m)
+ARCH ?= $(shell uname -m)
 SRCARCH := $(ARCH)
 
 # Additional ARCH settings for x86
@@ -12,6 +12,11 @@ endif
 # Additional ARCH settings for arm64
 ifeq ($(ARCH),aarch64)
         SRCARCH := arm64
+endif
+
+# Additional ARCH settings for loongarch64
+ifeq ($(ARCH),loongarch64)
+        SRCARCH := loongarch
 endif
 
 # Additional ARCH settings for sparc

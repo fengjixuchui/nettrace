@@ -2,6 +2,7 @@
 """ script that generate trace group info """
 import sys
 import yaml
+import re
 
 global_status = {}
 global_names = {}
@@ -24,38 +25,21 @@ rule_types = {
 
 
 def parse_names(trace, children):
+    children.remove(trace)
     names = trace['names']
-    first = names[0]
-    prev = None
-    if isinstance(first, str):
-        trace['name'] = first
-    else:
-        trace['name'] = first['name']
-        if 'cond' in first:
-            trace['cond'] = first['cond'].replace('"', '\\"')
-
     del trace['names']
-    prev = trace
 
-    for index in range(1, len(names)):
-        name = names[index]
-        new_child = dict(trace)
-
+    for name in names:
         if isinstance(name, str):
-            new_child['name'] = name
-            del new_child['cond']
-        else:
-            new_child['name'] = name['name']
-            if 'cond' in name:
-                new_child['cond'] = name['cond'].replace('"', '\\"')
-            elif 'cond' in new_child:
-                del new_child['cond']
+            name = {'name': name}
 
-        prev['next'] = new_child
-        prev = new_child
-        children.append(new_child)
+        tmp = dict(trace)
+        tmp.update(name)
+        name.update(tmp)
+        if 'cond' in name:
+            name['cond'] = name['cond'].replace('"', '\\"')
 
-    prev['next'] = trace
+        children.append(name)
 
 
 def parse_group(group):
@@ -66,29 +50,31 @@ def parse_group(group):
     i = 0
     while i < len(children):
         child = children[i]
-        if not isinstance(child, str):
-            parse_group(child)
-            i += 1
-            if 'names' in child:
-                parse_names(child, children)
-            name_split = child['name'].split(':')
-            if len(name_split) > 1:
-                child['name'] = name_split[0]
-                child['skb'] = name_split[1]
+        if 'backup' in child:
+            child['backup']['is_backup'] = True
+
+        if isinstance(child, str):
+            children.remove(child)
+            child = {
+                "name": child
+            }
+            children.insert(i, child)
+
+        parse_group(child)
+        if 'names' in child:
+            parse_names(child, children)
             continue
-        children.remove(child)
-        data = child.split(':')
-        if len(data) <= 1:
-            child = {
-                "name": data[0]
-            }
-        else:
-            child = {
-                "name": data[0],
-                "skb": int(data[1])
-            }
-        children.insert(i, child)
         i += 1
+        if 'children' in child:
+            continue
+
+        name_split = child['name'].split(':')
+        if len(name_split) > 1:
+            child['skb'] = int(re.match(r'\d+', name_split[1]).group())
+        name_split = child['name'].split('/')
+        if len(name_split) > 1:
+            child['sock'] = int(re.match(r'\d+', name_split[1]).group())
+        child['name'] = re.match(r'[a-zA-Z_0-9]+', child['name']).group()
 
 
 def gen_group_init(group, name):
@@ -112,6 +98,24 @@ def gen_name(name, is_trace=False):
         return f'{name}_{global_names[name]}'
     global_names[name] = 0
     return name
+
+
+btf_data = None
+
+
+def get_arg_count(name):
+    global btf_data
+    if not btf_data:
+        with open("btf.raw", 'r', encoding='utf-8') as btf_file:
+            btf_data = btf_file.read()
+    reg_text = f"'{name}' type_id=([0-9]+)"
+    match = re.search(reg_text, btf_data)
+    if not match:
+        return 0
+
+    type_id = match.group(1)
+    match = re.search(f"\\[{type_id}\\].*vlen=([0-9]+)", btf_data)
+    return match.group(1)
 
 
 def gen_rules(rules, name):
@@ -142,7 +146,57 @@ def gen_rules(rules, name):
     return (rule_str, init_str)
 
 
+def append_trace_field(field, trace, type='string'):
+    if type == 'string':
+        return f'\n\t.{field} = "{trace[field]}",' if field in trace else ''
+    if type == 'bool':
+        value = 'true' if trace.get(field) else 'false'
+        return f'\n\t.{field} = {value},'
+    if type == 'raw':
+        if field in trace:
+            return f'\n\t.{field} = {trace[field]},'
+    return ''
+
+
+def append_filed(field, value, type='string'):
+    if type == 'string':
+        return f'\n\t.{field} = "{value}",'
+    if type == 'bool':
+        value = 'true' if value else 'false'
+        return f'\n\t.{field} = {value},'
+    if type == 'raw':
+        return f'\n\t.{field} = {value},'
+    return ''
+
+
+def gen_trace_list(trace, p_name):
+    name = trace['define_name']
+    list_count = trace.get('list_count', 1)
+    list_count += 1
+    trace['list_count'] = list_count
+    trace_name = 'trace_' + name
+    trace_list = f'{trace_name}_list_{list_count}'
+    define_str = f'''
+trace_list_t {trace_list} = {{
+\t.trace = &{trace_name},
+\t.list = LIST_HEAD_INIT({trace_list}.list)
+}};
+'''
+    init_str = f'\tlist_add_tail(&{trace_list}.list, &{p_name}.traces);\n'
+
+    return {
+        'define_str': define_str,
+        'init_str': init_str,
+        'probe_str': '',
+        'index_str': ''
+    }
+
+
 def gen_trace(trace, group, p_name):
+    # trace is already defined, just define corresponding trace_list for it
+    if 'define_name' in trace:
+        return gen_trace_list(trace, p_name)
+
     name = gen_name(trace["name"], True)
     trace_name = 'trace_' + name
     trace['define_name'] = name
@@ -151,6 +205,10 @@ def gen_trace(trace, group, p_name):
     index_str = f'#define INDEX_{name} {global_status["trace_index"]}\n'
     rule_str = ''
     init_str = ''
+    fields_str = ''
+    skb_index = 0
+    sk_index = 0
+    target = trace.get('target') or trace['name']
 
     if 'tp' in trace:
         trace_type = 'TRACE_TP'
@@ -160,46 +218,73 @@ def gen_trace(trace, group, p_name):
             probe_str = f'\tFN_tp({name}, {tp[0]}, {tp[1]}, {trace["skb"]})\t\\\n'
     else:
         trace_type = 'TRACE_FUNCTION'
-        if 'skb' in trace:
-            skb_index = int(trace["skb"]) + 1
-            skb_str = f'\n\t.skb = {skb_index},'
-            probe_str = f'\tFN({name}, {skb_index})\t\\\n'
+        if 'skb' in trace or 'sock' in trace:
+            arg_count = '0'
+            if 'monitor' in trace:
+                if 'arg_count' not in trace:
+                    trace['arg_count'] = get_arg_count(target)
+                    arg_count = trace['arg_count']
+                else:
+                    arg_count = trace['arg_count']
+                if not arg_count:
+                    print(
+                        f"BTF not found for {target}, skip monitor", file=sys.stderr)
+                    trace['monitor'] = 0
+                else:
+                    fields_str += append_trace_field('arg_count', trace, 'raw')
+            if 'skb' in trace:
+                skb_index = int(trace["skb"]) + 1
+                skb_str = f'\n\t.skb = {skb_index},'
+            if 'sock' in trace:
+                sk_index = int(trace["sock"]) + 1
+            if 'custom' not in trace:
+                probe_str = f'\tFN({name}, {skb_index}, {sk_index}, {arg_count})\t\\\n'
+            else:
+                probe_str = f'\tFNC({name})\t\\\n'
         else:
             probe_str = f'\tFNC({name})\t\\\n'
     if 'analyzer' in trace:
         analyzer = f'\n\t.analyzer = &ANALYZER({trace["analyzer"]}),'
     else:
-        analyzer = ''
+        analyzer = '\n\t.analyzer = &ANALYZER(default),'
 
-    if 'rules' in trace:
+    if 'rules' in trace and trace['rules']:
         rules = trace['rules']
         (rule_str, _init_str) = gen_rules(rules, trace_name)
         init_str += _init_str
 
-    cond_str = f'\n\t.cond = "{trace["cond"]}",' if 'cond' in trace else ''
-    reg_str = f'\n\t.regex = "{trace["regex"]}",' if 'regex' in trace else ''
-    msg_str = f'\n\t.msg = "{trace["msg"]}",' if 'msg' in trace else ''
+    fields_str += append_trace_field('cond', trace)
+    fields_str += append_trace_field('regex', trace)
+    fields_str += append_trace_field('msg', trace)
+    fields_str += append_trace_field('is_backup', trace, 'bool')
+    fields_str += append_trace_field('probe', trace, 'bool')
+    fields_str += append_trace_field('monitor', trace, 'raw')
+    fields_str += append_filed('name', target)
+
     default = True
     if 'default' in trace:
         default = trace['default']
     elif 'default' in group:
         default = group['default']
-    default = 'true' if default else 'false'
-    default = f'\n\t.def = {default},'
-    target = trace.get('target') or trace['name']
+    fields_str += append_filed('def', default, 'bool')
+
     define_str = f'''trace_t {trace_name} = {{
-\t.name = "{target}",
-\t.desc = "{trace.get('desc') or ''}",{skb_str}{cond_str}{default}
-\t.type = {trace_type},{reg_str}{analyzer}{msg_str}
+\t.desc = "{trace.get('desc') or ''}",{skb_str}
+\t.type = {trace_type},{analyzer}{fields_str}
 \t.index = INDEX_{name},
 \t.prog = "__trace_{name}",
 \t.parent = &{p_name},
-\t.rules =  LIST_HEAD_INIT({trace_name}.rules),
-\t.mutex = {'true' if trace.get('mutex') else 'false'},
+\t.sk = {sk_index},
+\t.rules = LIST_HEAD_INIT({trace_name}.rules),
+}};
+trace_list_t {trace_name}_list = {{
+\t.trace = &{trace_name},
+\t.list = LIST_HEAD_INIT({trace_name}_list.list)
 }};
 {rule_str}
 '''
-    init_str += f'''\tlist_add_tail(&{trace_name}.list, &{p_name}.traces);
+
+    init_str += f'''\tlist_add_tail(&{trace_name}_list.list, &{p_name}.traces);
 \tall_traces[INDEX_{name}] = &{trace_name};
 \tlist_add_tail(&{trace_name}.all, &trace_list);
 '''
@@ -251,10 +336,10 @@ def gen_group(group, is_root=False):
     for child in group['children']:
         if 'children' in child:
             continue
-        sibling = 'NULL'
-        if 'next' in child:
-            sibling = f"&trace_{child['next']['define_name']}"
-        result['init_str'] += f"\ttrace_{child['define_name']}.sibling = {sibling};\n"
+        backup = 'NULL'
+        if 'backup' in child:
+            backup = f"&trace_{child['backup']['define_name']}"
+        result['init_str'] += f"\ttrace_{child['define_name']}.backup = {backup};\n"
     return result
 
 

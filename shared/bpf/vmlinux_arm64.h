@@ -8018,16 +8018,16 @@ struct sock {
 	unsigned int sk_gso_max_size;
 	gfp_t sk_allocation;
 	__u32 sk_txhash;
-	unsigned int __sk_flags_offset[0];
-	unsigned int sk_padding: 1;
-	unsigned int sk_kern_sock: 1;
-	unsigned int sk_no_check_tx: 1;
-	unsigned int sk_no_check_rx: 1;
-	unsigned int sk_userlocks: 4;
-	unsigned int sk_protocol: 8;
-	unsigned int sk_type: 16;
-	u16 sk_gso_max_segs;
+	unsigned int		__sk_flags_offset[0];
+	u8 sk_padding: 1;
+	u8 sk_kern_sock: 1;
+	u8 sk_no_check_tx: 1;
+	u8 sk_no_check_rx: 1;
+	u8 sk_userlocks: 4;
 	u8 sk_pacing_shift;
+	u16 sk_type;
+	u16 sk_protocol;
+	u16 sk_gso_max_segs;
 	long unsigned int sk_lingertime;
 	struct proto *sk_prot_creator;
 	rwlock_t sk_callback_lock;
@@ -28180,7 +28180,46 @@ enum bpf_func_id {
 	BPF_FUNC_timer_set_callback = 170,
 	BPF_FUNC_timer_start = 171,
 	BPF_FUNC_timer_cancel = 172,
-	__BPF_FUNC_MAX_ID = 173,
+	BPF_FUNC_get_func_ip = 173,
+	BPF_FUNC_get_attach_cookie = 174,
+	BPF_FUNC_task_pt_regs = 175,
+	BPF_FUNC_get_branch_snapshot = 176,
+	BPF_FUNC_trace_vprintk = 177,
+	BPF_FUNC_skc_to_unix_sock = 178,
+	BPF_FUNC_kallsyms_lookup_name = 179,
+	BPF_FUNC_find_vma = 180,
+	BPF_FUNC_loop = 181,
+	BPF_FUNC_strncmp = 182,
+	BPF_FUNC_get_func_arg = 183,
+	BPF_FUNC_get_func_ret = 184,
+	BPF_FUNC_get_func_arg_cnt = 185,
+	BPF_FUNC_get_retval = 186,
+	BPF_FUNC_set_retval = 187,
+	BPF_FUNC_xdp_get_buff_len = 188,
+	BPF_FUNC_xdp_load_bytes = 189,
+	BPF_FUNC_xdp_store_bytes = 190,
+	BPF_FUNC_copy_from_user_task = 191,
+	BPF_FUNC_skb_set_tstamp = 192,
+	BPF_FUNC_ima_file_hash = 193,
+	BPF_FUNC_kptr_xchg = 194,
+	BPF_FUNC_map_lookup_percpu_elem = 195,
+	BPF_FUNC_skc_to_mptcp_sock = 196,
+	BPF_FUNC_dynptr_from_mem = 197,
+	BPF_FUNC_ringbuf_reserve_dynptr = 198,
+	BPF_FUNC_ringbuf_submit_dynptr = 199,
+	BPF_FUNC_ringbuf_discard_dynptr = 200,
+	BPF_FUNC_dynptr_read = 201,
+	BPF_FUNC_dynptr_write = 202,
+	BPF_FUNC_dynptr_data = 203,
+	BPF_FUNC_tcp_raw_gen_syncookie_ipv4 = 204,
+	BPF_FUNC_tcp_raw_gen_syncookie_ipv6 = 205,
+	BPF_FUNC_tcp_raw_check_syncookie_ipv4 = 206,
+	BPF_FUNC_tcp_raw_check_syncookie_ipv6 = 207,
+	BPF_FUNC_ktime_get_tai_ns = 208,
+	BPF_FUNC_user_ringbuf_drain = 209,
+	BPF_FUNC_cgrp_storage_get = 210,
+	BPF_FUNC_cgrp_storage_delete = 211,
+	__BPF_FUNC_MAX_ID = 212,
 };
 
 enum {
@@ -121812,6 +121851,10 @@ enum flow_offload_tuple_dir {
 	FLOW_OFFLOAD_DIR_MAX = 2,
 };
 
+#ifndef BPF_NO_PRESERVE_ACCESS_INDEX
+#pragma clang attribute pop
+#endif
+
 struct nft_pktinfo {
 	struct sk_buff *skb;
 	bool tprot_set;
@@ -122068,6 +122111,10 @@ struct nft_jumpstack {
 	const struct nft_chain *chain;
 	struct nft_rule * const *rules;
 };
+
+#ifndef BPF_NO_PRESERVE_ACCESS_INDEX
+#pragma clang attribute push (__attribute__((preserve_access_index)), apply_to = record)
+#endif
 
 enum nf_tables_msg_types {
 	NFT_MSG_NEWTABLE = 0,
@@ -127413,14 +127460,14 @@ struct xa_limit {
 	u32 min;
 };
 
+#ifndef BPF_NO_PRESERVE_ACCESS_INDEX
+#pragma clang attribute pop
+#endif
+
 struct ip_esp_hdr {
 	__be32 spi;
 	__be32 seq_no;		/* Sequence number */
 	__u8  enc_data[0];	/* Variable len but >=8. Mind the 64 bit alignment! */
 };
-
-#ifndef BPF_NO_PRESERVE_ACCESS_INDEX
-#pragma clang attribute pop
-#endif
 
 #endif /* __VMLINUX_H__ */

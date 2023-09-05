@@ -1,11 +1,11 @@
 ---
 name: all
 desc: trace the whole kernel network stack
-rules:
-  rule_ret_err: &rule_ret_err
+common_rules:
+  define: &rule_ret_err
     exp: ne 0
     level: error
-  rules_nf: &rules_nf
+  define: &rules_nf
     - exp: eq 0
       level: error
       msg: packet is dropped
@@ -13,6 +13,9 @@ rules:
     - exp: eq 1
       level: info
       msg: packet is accepted
+  define: &rule_msg
+    - exp: any
+      level: info
 children:
 - name: link
   desc: link layer (L2) of the network stack
@@ -31,6 +34,7 @@ children:
         msg: packet is dropped by GRO
     - name: enqueue_to_backlog:0
       analyzer: ret
+      monitor: 1
       rules:
       - <<: *rule_ret_err
         msg: failed to enqeueu to CPU backlog
@@ -50,39 +54,33 @@ children:
         msg: packet is redirected by XDP program
     - name: xdp_do_generic_redirect:1
       analyzer: ret
+      monitor: 1
       rules:
       - <<: *rule_ret_err
         msg: XDP failed to redirect skb
         adv: check if the target ifindex exist
     - names:
+      - &__netif_receive_skb_core
+        name: __netif_receive_skb_core:0
       - name: __netif_receive_skb_core_pskb
         cond: '[ ! $(verlte "$(uname -r)" "5.4") -eq -1 ]' # valid when kernel >= 5.4
-      - name: __netif_receive_skb_core:0
+        backup: *__netif_receive_skb_core
       target: __netif_receive_skb_core
-      mutex: true
   - name: link-out
     desc: link layer (L2) of packet out
     visual: true
     children:
     - name: __dev_queue_xmit:0
       analyzer: ret
+      monitor: 1
       rules:
       - <<: *rule_ret_err
         msg: failed to queue packet to qdisc
         adv: too complex to say
-    - dev_hard_start_xmit:0
-    - name: dev_qdisc_enqueue
-      analyzer: qdisc
+    - name: dev_hard_start_xmit:0
       rules:
-      - exp: ne 0
-        level: error
-        msg: failed to queue packet to qdisc
-    - name: sch_direct_xmit
-      analyzer: qdisc
-      rules:
-      - exp: eq 0
-        level: error
-        msg: failed to direct xmit
+      - <<: *rule_msg
+        msg: skb is successfully sent to the NIC driver
   - name: sched
     desc: TC(traffic control) module
     visual: true
@@ -90,7 +88,25 @@ children:
     - tcf_classify:0
     - cls_bpf_classify:0
     - tcf_bpf_act:0
-  - name: ipvaln
+    - name: pfifo_enqueue
+      analyzer: qdisc
+      monitor: 1
+      target: pfifo_enqueue
+      rules:
+      - exp: ne 0
+        level: error
+        msg: failed to queue packet to qdisc
+    - name: pfifo_fast_enqueue
+      analyzer: qdisc
+      target: pfifo_fast_enqueue
+      monitor: 1
+      rules:
+      - exp: ne 0
+        level: error
+        msg: failed to queue packet to qdisc
+    - name: sch_direct_xmit
+      analyzer: qdisc
+  - name: ipvlan
     desc: ipvlan network interface
     default: false
     visual: true
@@ -106,19 +122,19 @@ children:
     visual: true
     children:
     - name: br_nf_pre_routing:1
-      analysis: ret
+      analyzer: ret
       msg: ebtable in PREROUTING
       rules: *rules_nf
     - name: br_nf_forward_ip:1
-      analysis: ret
+      analyzer: ret
       msg: ebtable in FORWARD
       rules: *rules_nf
     - name: br_nf_forward_arp:1
-      analysis: ret
+      analyzer: ret
       msg: ebtable in FORWARD
       rules: *rules_nf
     - name: br_nf_post_routing:1
-      analysis: ret
+      analyzer: ret
       msg: ebtable in POST_ROUTING
       rules: *rules_nf
   - name: arp
@@ -154,11 +170,13 @@ children:
     visual: true
     children:
     - names:
-      - name: ipt_do_table
+      - &ipt_do_table
+        name: ipt_do_table
+      - name: ipt_do_table_legacy
         cond: '[ $(verlte "$(uname -r)" "5.16") -eq -1 ]' # valid when kernel < 5.16
-      - name: ipt_do_table_new
+        backup: *ipt_do_table
       analyzer: iptable
-      mutex: true
+      monitor: 1
       target: ipt_do_table
       rules:
       - exp: eq 0
@@ -168,15 +186,9 @@ children:
       - exp: eq 1
         level: info
         msg: packet is accepted
-    - names:
-      - name: nft_do_chain
-        cond: >-
-          zgrep DEBUG_INFO_BTF_MODULES /proc/config.gz 2>/dev/null ||
-          grep " nft_do_chain$" /proc/kallsyms
-      - nft_do_chain_compat
+    - name: nft_do_chain
       analyzer: iptable
-      target: nft_do_chain
-      mutex: true
+      monitor: 1
       rules:
       - exp: eq 0
         level: error
@@ -192,6 +204,7 @@ children:
         msg: NAT happens (packet address will change)
         level: warn
     - name: nf_hook_slow
+      monitor: 1
       analyzer: nf
       rules:
       - exp: eq -1
@@ -213,7 +226,10 @@ children:
     - resolve_normal_ct:2
     - tcp_packet:1
     - name: tcp_in_window:4
-      analysis: ret
+      default: true
+      analyzer: ret
+      monitor: 1
+      arg_count: 7
       rules:
       - exp: eq 0
         level: warn
@@ -282,6 +298,7 @@ children:
     visual: true
     children:
     - name: fib_validate_source:0
+      monitor: 1
       rules:
       - <<: *rule_ret_err
         msg: source address valid failed (properly rp_filter fail)
@@ -289,6 +306,7 @@ children:
           check you ip route config or disable rp_filter with command
           'echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter'
     - name: ip_route_input_slow:0
+      monitor: 1
       rules:
       - <<: *rule_ret_err
         msg: failed to route packet in input path
@@ -308,10 +326,24 @@ children:
     - tcp_v6_send_reset:1
     - tcp_v4_do_rcv:1
     - tcp_v6_do_rcv:1
-    - tcp_rcv_established:1
-    - tcp_rcv_state_process:1
-    - tcp_queue_rcv:1
+    - tcp_rcv_established:1/0
+    - &tcp_rcv_state_process
+      name: tcp_rcv_state_process:1/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP socket state has changed
+    - tcp_queue_rcv:1/0
+    - tcp_ack_probe/0
+    - tcp_ack:1/0
+    - tcp_probe_timer/0
+    - name: tcp_send_probe0/0
+      rules:
+      - exp: any
+        level: info
+        msg: send zero-window probe packet
     - name: __inet_lookup_listener:2
+      monitor: 1
       analyzer: ret
       rules:
       - exp: eq 0
@@ -320,11 +352,23 @@ children:
         adv: check your target tcp port
     - name: inet6_lookup_listener:2
       analyzer: ret
+      monitor: 1
       rules:
       - exp: eq 0
         level: warn
         msg: tcp port is not listened
         adv: check your target tcp port
+  - name: tcp-out
+    desc: tcp layer of packet out
+    visiual: true
+    children:
+    - name: __tcp_transmit_skb/0
+      rules:
+      - exp: ne 0
+        level: warn
+        msg: failed to xmit skb to ip layer
+    - tcp_sendmsg_locked/0
+    - __tcp_push_pending_frames/0
 - name: udp
   desc: udp protocol layer (L4) of the network stack
   children:
@@ -361,6 +405,59 @@ children:
         level: warn
         msg: icmp socket is not founded
         adv: not support
+- name: socket
+  desc: socket releated hooks
+  visiual: true
+  children:
+  - name: tcp-state
+    desc: TCP socket state releated hooks
+    children:
+    - name: inet_listen/0
+      custom: true
+      rules:
+      - exp: any
+        level: info
+        msg: TCP socket begin to listen
+    - tcp_v4_destroy_sock/0
+    - name: tcp_close/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP socket is closed
+    - *tcp_rcv_state_process
+  - name: tcp-congestion
+    desc: TCP congestion control releated hooks
+    children:
+    - tcp_write_timer_handler/0
+    - name: tcp_retransmit_timer/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP retransmission timer out
+    - name: tcp_enter_recovery/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP enter conguestion recover
+    - name: tcp_enter_loss/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP enter conguestion loss
+    - name: tcp_try_keep_open/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP enter conguestion open state
+    - name: tcp_enter_cwr/0
+      rules:
+      - exp: any
+        level: info
+        msg: TCP enter conguestion CWR state
+    - tcp_fastretrans_alert/0
+    - tcp_rearm_rto/0
+    - tcp_event_new_data_sent/0
+    - tcp_schedule_loss_probe/0
 - name: life
   desc: skb clone and free
   visual: true
@@ -386,6 +483,7 @@ children:
   - name: kfree_skb
     tp: skb:kfree_skb
     analyzer: drop
+    monitor: 1
     rules:
     - exp: any
       level: error

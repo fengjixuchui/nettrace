@@ -6,21 +6,6 @@
 #include "progs/shared.h"
 #include "trace.h"
 
-enum rule_type {
-	/* equal */
-	RULE_RETURN_EQ,
-	/* not equal */
-	RULE_RETURN_NE,
-	/* less than */
-	RULE_RETURN_LT,
-	/* greater then */
-	RULE_RETURN_GT,
-	/* in range */
-	RULE_RETURN_RANGE,
-	/* always active this rule */
-	RULE_RETURN_ANY,
-};
-
 enum rule_level {
 	RULE_INFO,
 	RULE_WARN,
@@ -107,18 +92,31 @@ typedef struct analyzer {
 
 #define ANALYZER(name) analyzer_##name
 #define DEFINE_ANALYZER_PART(name, type, mode_mask)			\
-	analyzer_result_t analyzer_##name##_##type(trace_t *trace,	\
-						analy_##type##_t *e);	\
+	analyzer_result_t analyzer_##name##_exit(trace_t *trace,	\
+		analy_exit_t *e) __attribute__((weak));			\
+	analyzer_result_t analyzer_##name##_entry(trace_t *trace,	\
+		analy_entry_t *e) __attribute__((weak));		\
 	analyzer_t ANALYZER(name) = {					\
-		.analy_##type =analyzer_##name##_##type,		\
+		.analy_entry = analyzer_##name##_entry,			\
+		.analy_exit = analyzer_##name##_exit,			\
 		.mode = mode_mask,					\
 	};								\
 	analyzer_result_t analyzer_##name##_##type(trace_t *trace,	\
-						   analy_##type##_t *e)
-#define DEFINE_ANALYZER_ENTRY(name, mode)	\
+		analy_##type##_t *e)
+#define DEFINE_ANALYZER_ENTRY(name, mode)				\
 	DEFINE_ANALYZER_PART(name, entry, mode)
-#define DEFINE_ANALYZER_EXIT(name, mode)	\
+#define DEFINE_ANALYZER_EXIT(name, mode)				\
 	DEFINE_ANALYZER_PART(name, exit, mode)
+#define DEFINE_ANALYZER_EXIT_FUNC(name)					\
+	analyzer_result_t analyzer_##name##_exit(trace_t *trace,	\
+		analy_exit_t *e)
+
+#define DEFINE_ANALYZER_EXIT_FUNC_DEFAULT(name)				\
+DEFINE_ANALYZER_EXIT_FUNC(name)						\
+{									\
+	rule_run_ret(e->entry, trace, e->event.val);			\
+	return RESULT_CONT;						\
+}
 
 #define DECLARE_ANALYZER(name) extern analyzer_t ANALYZER(name)
 #define IS_ANALYZER(target, name) (target == &(ANALYZER(name)))
@@ -130,9 +128,23 @@ DECLARE_ANALYZER(ret);
 DECLARE_ANALYZER(iptable);
 DECLARE_ANALYZER(nf);
 DECLARE_ANALYZER(qdisc);
+DECLARE_ANALYZER(default);
+
+#ifndef COMPAT_MODE
+#define define_pure_event(type, name, data)			\
+	pure_##type *name =					\
+		(!trace_ctx.detail ? (void *)(data) +		\
+			offsetof(type, __event_filed) :		\
+			(void *)(data) +			\
+			offsetof(detail_##type, __event_filed))
+#else
+#define define_pure_event(type, name, data)			\
+	detail_##type *name = (void *)(data)
+#endif
 
 void tl_poll_handler(void *raw_ctx, int cpu, void *data, u32 size);
 void basic_poll_handler(void *ctx, int cpu, void *data, u32 size);
+void async_poll_handler(void *ctx, int cpu, void *data, u32 size);
 
 static inline trace_t *get_trace_from_analy_entry(analy_entry_t *e)
 {
@@ -152,6 +164,16 @@ static inline void get_analy_ctx(analy_ctx_t *ctx)
 static inline void put_analy_ctx(analy_ctx_t *ctx)
 {
 	ctx->refs--;
+}
+
+static inline u32 get_lifetime_ms(analy_ctx_t *ctx)
+{
+	analy_entry_t *first, *last;
+
+	first = list_first_entry(&ctx->entries, analy_entry_t, list);
+	last = list_last_entry(&ctx->entries, analy_entry_t, list);
+
+	return (last->event->pkt.ts - first->event->pkt.ts) / 1000000;
 }
 
 static inline void get_fake_analy_ctx(fake_analy_ctx_t *ctx)
@@ -184,6 +206,12 @@ static inline void entry_set_msg(analy_entry_t *e, char *info)
 {
 	e->msg = info;
 	e->status |= ANALY_ENTRY_MSG;
+}
+
+static inline bool mode_has_context()
+{
+	return (1 << trace_ctx.mode) & (TRACE_MODE_TIMELINE_MASK |
+		TRACE_MODE_DIAG_MASK);
 }
 
 #endif

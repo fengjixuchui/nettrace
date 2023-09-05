@@ -11,6 +11,8 @@
 #include <fcntl.h>
 #include <stdio.h>
 
+#include "net_utils.h"
+
 extern int log_level;
 
 int	execf(char *output, char *fmt, ...);
@@ -20,6 +22,8 @@ bool	fsearch(FILE *f, char *target);
 int	kernel_version();
 bool	debugfs_mounted();
 bool	kernel_has_config(char *name);
+int	kernel_hz();
+u32	file_inode(char *path);
 
 static inline int simple_exec(char *cmd)
 {
@@ -50,7 +54,7 @@ do {						\
 
 #define pr_info(fmt, args...)	pr_level(0, stdout, fmt, ##args)
 #define pr_verb(fmt, args...)	pr_level(1, stdout, fmt, ##args)
-#define pr_warn(fmt, args...)	pr_level(1, stderr, "\033[0;34mWARN: "fmt"\033[0m", ##args)
+#define pr_warn(fmt, args...)	pr_level(0, stderr, "\033[0;34mWARN: "fmt"\033[0m", ##args)
 #define pr_err(fmt, args...)	pr_level(0, stderr, "\033[0;31mERROR: "fmt"\033[0m", ##args)
 #define pr_debug(fmt, args...)	pr_level(2, stdout, "DEBUG: "fmt, ##args)
 

@@ -15,9 +15,6 @@ struct list_head cpus[MAX_CPU_COUNT];
 trace_ops_t probe_ops;
 static struct kprobe *skel;
 
-#define probe_program(obj, name)	\
-	bpf_object__find_program_by_name(obj, name)
-
 static void probe_trace_attach_manual(char *prog_name, char *func,
 				      bool retprobe)
 {
@@ -25,9 +22,9 @@ static void probe_trace_attach_manual(char *prog_name, char *func,
 	bool legacy;
 	int err;
 
-	prog = probe_program(skel->obj, prog_name);
+	prog = bpf_pbn(skel->obj, prog_name);
 	if (!prog) {
-		pr_warn("failed to find prog %s\n", prog_name);
+		pr_verb("failed to find prog %s\n", prog_name);
 		return;
 	}
 
@@ -43,7 +40,7 @@ again:
 					       func, retprobe);
 
 	if (err && !legacy) {
-		pr_warn("retring to attach in legacy mode, prog=%s, func=%s\n",
+		pr_verb("retring to attach in legacy mode, prog=%s, func=%s\n",
 			prog_name, func);
 		legacy = true;
 		goto again;
@@ -78,47 +75,6 @@ static int probe_trace_attach()
 	return kprobe__attach(skel);
 }
 
-static int probe_trace_pre_load()
-{
-	char kret_name[128], regex[128], *func;
-	struct bpf_program *prog;
-	bool manual, autoload;
-	trace_t *trace;
-
-	/* disable all programs that is not enabled or invalid */
-	trace_for_each(trace) {
-		autoload = !trace_is_invalid(trace) &&
-			   trace_is_enable(trace);
-
-		if (autoload)
-			goto check_ret;
-
-		prog = probe_program(skel->obj, trace->prog);
-		if (!prog) {
-			pr_warn("prog: %s not founded\n", trace->prog);
-			continue;
-		}
-		bpf_program__set_autoload(prog, false);
-		pr_debug("prog: %s is made no-autoload\n", trace->prog);
-
-check_ret:
-		if (!trace_is_func(trace) || (trace_is_ret(trace) &&
-		    autoload))
-			continue;
-
-		sprintf(kret_name, "ret%s", trace->prog);
-		prog = probe_program(skel->obj, kret_name);
-		if (!prog) {
-			pr_warn("prog: %s not founded\n", kret_name);
-			continue;
-		}
-		bpf_program__set_autoload(prog, false);
-		pr_debug("prog: %s is made no-autoload\n", trace->prog);
-	}
-
-	return 0;
-}
-
 static int probe_trace_load()
 {
 	int i = 0;
@@ -133,14 +89,14 @@ static int probe_trace_load()
 	/* set the max entries of perf event map to current cpu count */
 	bpf_map__set_max_entries(skel->maps.m_event, get_nprocs_conf());
 
-	if (probe_trace_pre_load() || kprobe__load(skel)) {
+	trace_ctx.obj = skel->obj;
+	if (trace_pre_load() || kprobe__load(skel)) {
 		pr_err("failed to load kprobe-based eBPF\n");
 		goto err;
 	}
 	pr_debug("eBPF is loaded successfully\n");
 
 	bpf_set_config(skel, bss, trace_ctx.bpf_args);
-	trace_ctx.obj = skel->obj;
 
 	for (; i < ARRAY_SIZE(cpus); i++)
 		INIT_LIST_HEAD(&cpus[i]);
@@ -150,7 +106,10 @@ static int probe_trace_load()
 	case TRACE_MODE_DROP:
 		probe_ops.trace_poll = basic_poll_handler;
 		break;
-	case TRACE_MODE_INETL:
+	case TRACE_MODE_SOCK:
+		probe_ops.trace_poll = async_poll_handler;
+		break;
+	case TRACE_MODE_DIAG:
 	case TRACE_MODE_TIMELINE:
 		probe_ops.trace_poll = tl_poll_handler;
 		break;
@@ -161,10 +120,46 @@ err:
 	return -1;
 }
 
+static bool is_trace_supported(trace_t *trace)
+{
+	struct kprobe *tmp = kprobe__open();
+	struct bpf_program *prog;
+	int err;
+
+	bpf_object__for_each_program(prog, tmp->obj) {
+		if (strcmp(trace->prog, bpf_program__name(prog)) != 0)
+			bpf_program__set_autoload(prog, false);
+	}
+	err = kprobe__load(tmp);
+	kprobe__destroy(tmp);
+
+	if (err)
+		pr_verb("kernel feature probe failed for trace: %s\n",
+			trace->prog);
+	else
+		pr_debug("kernel feature probe success for trace: %s\n",
+			 trace->prog);
+
+	return err == 0;
+}
+
+static void probe_trace_feat_probe()
+{
+	trace_t *trace;
+
+	trace_for_each(trace) {
+		if (!trace->probe || !trace_is_usable(trace))
+			continue;
+		if (!is_trace_supported(trace))
+			trace_set_invalid(trace);
+	}
+}
+
 void probe_trace_close()
 {
 	if (skel)
 		kprobe__destroy(skel);
+	skel = NULL;
 }
 
 static analyzer_result_t probe_analy_exit(trace_t *trace, analy_exit_t *e)
@@ -232,6 +227,7 @@ static void probe_trace_ready()
 	bpf_set_config_field(skel, bss, ready, true);
 }
 
+#ifdef BPF_FEAT_STACK_TRACE
 static void probe_print_stack(int key)
 {
 	int map_fd = bpf_map__fd(skel->maps.m_stack);
@@ -253,9 +249,19 @@ static void probe_print_stack(int key)
 	}
 	pr_info("\n");
 }
+#else
+static void probe_print_stack(int key) { }
+#endif
 
-analyzer_t probe_analyzer =  {
-	.mode = TRACE_MODE_INETL_MASK | TRACE_MODE_TIMELINE_MASK,
+static bool probe_trace_supported()
+{
+	if (trace_ctx.mode == TRACE_MODE_MONITOR)
+		return false;
+	return true;
+}
+
+analyzer_t probe_analyzer = {
+	.mode = TRACE_MODE_DIAG_MASK | TRACE_MODE_TIMELINE_MASK,
 	.analy_entry = probe_analy_entry,
 	.analy_exit = probe_analy_exit,
 };
@@ -265,6 +271,8 @@ trace_ops_t probe_ops = {
 	.trace_load = probe_trace_load,
 	.trace_close = probe_trace_close,
 	.trace_ready = probe_trace_ready,
+	.trace_feat_probe = probe_trace_feat_probe,
+	.trace_supported = probe_trace_supported,
 	.print_stack = probe_print_stack,
 	.analyzer = &probe_analyzer,
 };

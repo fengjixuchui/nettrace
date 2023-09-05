@@ -36,6 +36,19 @@ nettrace - Linux系统下的网络报文跟踪、网络问题诊断工具
 `-p,--proto` *protocol*
   根据报文的协议（三层或者四层）进行过滤，如*-p udp*
 
+`--netns` *netns_inode*
+  根据网络命名空间进行过滤。
+  
+  该参数后面跟的是网络命名空间的inode，可以通过
+  `ls -l /proc/<pid>/ns/net`
+  来查看对应进程的网络命名空间的inode号
+
+`--netns-current`
+  仅显示当前网络命名空间的报文，等价于`--netns <当前网络命名空间的inode>`
+
+`--pid` *pid*
+  根据进程号进行过滤
+
 `-t,--trace` *traces*
   要启用（跟踪）的内核函数、tracepoint。
 
@@ -72,11 +85,27 @@ nettrace - Linux系统下的网络报文跟踪、网络问题诊断工具
 `--diag-keep`
   持续跟踪。`diag`模式下，默认在跟踪到异常报文后会停止跟踪，使用该参数后，会持续跟踪下去。
 
+`--sock`
+  启用套接口模式。这个模式下，不会再跟踪报文，而会跟踪套接口。
+
+`--monitor`
+  启用监控模式。一种轻量化的实时监控系统中网络异常的模式（对内核版本有一定要求）。
+
 `--hooks`
   打印netfilter上的钩子函数
 
 `--drop`
   进行系统丢包监控，取代原先的`droptrace`
+
+`--drop-stack`
+  打印kfree_skb内核函数的调用堆栈，等价于`--trace-stack kfree_skb`
+
+`--min-latency` *latency in ms*
+  根据报文的寿命进行过滤，仅打印处理时长超过该值的报文，单位为ms。该参数仅在默认和`diag`模式下可用。
+
+`--trace-stack` *traces*
+  指定需要进行堆栈打印的内核函数，可以指定多个，用“,”分隔。出于性能考虑，启用堆栈打印的
+  内核函数不能超过16个。用法和格式与`--trace`完全一致。
 
 `-v`
   显示程序启动的日志信息
@@ -96,6 +125,9 @@ nettrace - Linux系统下的网络报文跟踪、网络问题诊断工具
 
 显示详细信息：
   *nettrace -p icmp -s 192.168.1.8 --detail*
+
+打印堆栈：
+  *nettrace -p icmp -s 192.168.1.8 --trace-stack consume_skb,icmp_rcv*
 
 ### 诊断模式
 
@@ -260,6 +292,55 @@ end trace...
 
 可以看出，上面`following hook functions are blamed`中列出了导致当前`netfilter`
 丢包的所有的钩子函数，这里只有`iptables`一个钩子函数。
+
+### sock跟踪
+
+套接口跟踪在原理上与skb的basic模式很类似，只不过跟踪对象从skb换成了sock。
+常规的过滤参数，如ip、端口等，在该模式下都可以直接使用，基本用法如下所示：
+
+```shell
+sudo ./nettrace -p tcp --port 9999 --sock
+begin trace...
+[2157947.050509] [inet_listen         ] TCP: 0.0.0.0:9999 -> 0.0.0.0:0 info:(0 0)
+[2157958.364842] [__tcp_transmit_skb  ] TCP: 127.0.0.1:36562 -> 127.0.0.1:9999 info:(1 0)
+[2157958.364875] [tcp_rcv_state_process] TCP: 0.0.0.0:9999 -> 0.0.0.0:0 info:(0 0)
+[2157958.364890] [tcp_rcv_state_process] TCP: 127.0.0.1:36562 -> 127.0.0.1:9999 info:(1 0) timer:(retrans, 1.000s)
+[2157958.364896] [tcp_ack             ] TCP: 127.0.0.1:36562 -> 127.0.0.1:9999 info:(1 0) timer:(retrans, 1.000s)
+[2157958.364906] [__tcp_transmit_skb  ] TCP: 127.0.0.1:36562 -> 127.0.0.1:9999 info:(0 0)
+[2157958.364917] [tcp_rcv_state_process] TCP: 127.0.0.1:9999 -> 127.0.0.1:36562 info:(0 0)
+[2157958.364921] [tcp_ack             ] TCP: 127.0.0.1:9999 -> 127.0.0.1:36562 info:(0 0)
+[2157959.365240] [tcp_write_timer_handler] TCP: 127.0.0.1:36562 -> 127.0.0.1:9999 info:(0 0)
+```
+
+其中，`info`里显示的内容分别是：报文在外数量、报文重传数量。`timer`显示的为当前套接口上的定时器和超时时间。目前，信息还在不断完善中。
+
+### monitor模式
+
+常规的网络定位手段，包括上面的报文跟踪、诊断等方式，由于开销过大，不适合在生产环境中
+部署和常态化运行。监控模式能够提供一种更加轻量级别的网络异常、丢包监控。由于这种模式
+是基于`TRACING`类型的BPF，因此其对于内核版本有较高的要求。以下是内核版本要求：
+
+|  TencentOS | 开源版本 | BPF特性 | monitor |
+|---|---|---|---|
+|5.4.119-19.0009 | 5.5 | TRACING | 可用，不可监控内核模块中的函数和参数个数超过6的内核函数 |
+| 开发中 | 5.11 | BTF_MODULES | 可用，不可监控参数个数超过6的内核函数 |
+| 开发中 | 开发中 | TRACING支持6+参数 | 完全可用 |
+
+其中，“TRACING支持6+参数”目前正在开发中，具体进展可参见：
+
+[bpf, x86: allow function arguments up to 12 for TRACING](https://lore.kernel.org/bpf/20230607125911.145345-1-imagedong@tencent.com/)
+
+基本用法（在内核特性完全支持的情况下）：
+
+```shell
+$ nettrace --monitor
+begin trace...
+[25.167980] [nft_do_chain        ] ICMP: 192.168.122.1 -> 192.168.122.9 ping request, seq: 1, id: 1523 *iptables table:filter, chain:INPUT* *packet is dropped by iptables/iptables-nft*
+[25.167996] [kfree_skb           ] ICMP: 192.168.122.1 -> 192.168.122.9 ping request, seq: 1, id: 1523, reason: NETFILTER_DROP, nf_hook_slow+0xa8
+[25.168000] [nf_hook_slow        ] ICMP: 192.168.122.1 -> 192.168.122.9 ping request, seq: 1, id: 1523 *ipv4 in chain: INPUT* *packet is dropped by netfilter (NF_DROP)*
+```
+
+监控模式下，也可以使用普通模式的下各种参数，如报文过滤、`--detail`详情显示等。
 
 ## REQUIREMENTS
 
